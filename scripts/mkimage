@@ -32,9 +32,17 @@
     exit 1
   fi
 
+  if [ "$BOOTLOADER" = "syslinux" ]; then
+    DISK_LABEL=gpt
+  else
+    DISK_LABEL=msdos
+  fi
+
   STORAGE_SIZE=32 # STORAGE_SIZE must be >= 32 !
 
-  DISK_SIZE=$(( $SYSTEM_SIZE + $STORAGE_SIZE + 4 ))
+  DISK_START_PADDING=$(( ($SYSTEM_PART_START + 2048 - 1) / 2048 ))
+  DISK_GPT_PADDING=1
+  DISK_SIZE=$(( $DISK_START_PADDING + $SYSTEM_SIZE + $STORAGE_SIZE + $DISK_GPT_PADDING ))
   DISK="$TARGET_IMG/$IMAGE_NAME.img"
 
 # functions
@@ -61,8 +69,7 @@ trap cleanup SIGINT
   UUID_2=$(date '+%M%S')
   FAT_SERIAL_NUMBER="${UUID_1}${UUID_2}"
   UUID_SYSTEM="${UUID_1}-${UUID_2}"
-  FAT_VOLUME_LABEL="LAKKA"
-  EXT_VOLUME_LABEL="LAKKA_DISK"
+  FAT_VOLUME_LABEL="LAKKA64"
 
 # create an image
   echo
@@ -70,35 +77,36 @@ trap cleanup SIGINT
   dd if=/dev/zero of="$DISK" bs=1M count="$DISK_SIZE" conv=fsync >"$SAVE_ERROR" 2>&1 || show_error
 
 # write a disklabel
-  echo "image: creating partition table..."
-  if [ "$BOOTLOADER" = "syslinux" ]; then
-    parted -s "$DISK" mklabel gpt
-  else
-    parted -s "$DISK" mklabel msdos
-  fi
+  echo "image: creating $DISK_LABEL partition table..."
+  parted -s "$DISK" mklabel $DISK_LABEL
   sync
 
 # create part1
   echo "image: creating part1..."
-  SYSTEM_PART_END=$(( ($SYSTEM_SIZE * 1024 * 1024 / 512) + $SYSTEM_PART_START ))
-  parted -s "$DISK" -a min unit s mkpart primary fat32 $SYSTEM_PART_START $SYSTEM_PART_END
-  if [ "$BOOTLOADER" = "syslinux" ]; then
+  SYSTEM_PART_END=$(( $SYSTEM_PART_START + ($SYSTEM_SIZE * 1024 * 1024 / 512) - 1 ))
+  if [ "$DISK_LABEL" = "gpt" ]; then
+    parted -s "$DISK" -a min unit s mkpart system fat32 $SYSTEM_PART_START $SYSTEM_PART_END
     parted -s "$DISK" set 1 legacy_boot on
   else
+    parted -s "$DISK" -a min unit s mkpart primary fat32 $SYSTEM_PART_START $SYSTEM_PART_END
     parted -s "$DISK" set 1 boot on
   fi
   sync
 # create part2
   echo "image: creating part2..."
-  STORAGE_PART_START=$(( $SYSTEM_PART_END + 2048 ))
-  STORAGE_PART_END=$(( $STORAGE_PART_START + (( $STORAGE_SIZE * 1024 * 1024 / 512 )) ))
-  parted -s "$DISK" -a min unit s mkpart primary ext4 $STORAGE_PART_START $STORAGE_PART_END
+  STORAGE_PART_START=$(( $SYSTEM_PART_END + 1 ))
+  STORAGE_PART_END=$(( $STORAGE_PART_START + ($STORAGE_SIZE * 1024 * 1024 / 512) - 1 ))
+  if [ "$DISK_LABEL" = "gpt" ]; then
+    parted -s "$DISK" -a min unit s mkpart storage ext4 $STORAGE_PART_START $STORAGE_PART_END
+  else
+    parted -s "$DISK" -a min unit s mkpart primary ext4 $STORAGE_PART_START $STORAGE_PART_END
+  fi
   sync
 
 if [ "$BOOTLOADER" = "syslinux" ]; then
   # write mbr
     echo "image: writing mbr..."
-    MBR="$ROOT/$TOOLCHAIN/share/syslinux/gptmbr.bin"
+    MBR="$TOOLCHAIN/share/syslinux/gptmbr.bin"
     if [ -n "$MBR" ]; then
       dd bs=440 count=1 conv=fsync,notrunc if="$MBR" of="$DISK" >"$SAVE_ERROR" 2>&1 || show_error
     fi
@@ -116,10 +124,8 @@ fi
   alias mcopy="mcopy -i $DISK@@$OFFSET"
   alias mmd="mmd -i $DISK@@$OFFSET"
 
-  if [ "$BOOTLOADER" = "syslinux" ]; then
+  if [ "$BOOTLOADER" = "syslinux" -o "$BOOTLOADER" = "bcm2835-bootloader" -o "$BOOTLOADER" = "u-boot" ]; then
     mformat -v "$FAT_VOLUME_LABEL" -N "$FAT_SERIAL_NUMBER" ::
-  elif [ "$BOOTLOADER" = "bcm2835-bootloader" -o "$BOOTLOADER" = "u-boot" ]; then
-    mformat -v "$FAT_VOLUME_LABEL" ::
   fi
   sync
 
@@ -127,31 +133,23 @@ if [ "$BOOTLOADER" = "syslinux" ]; then
   # create bootloader configuration
     echo "image: creating bootloader configuration..."
     cat << EOF > "$LE_TMP"/syslinux.cfg
-SAY Wait for live session to start or press <TAB> for more options (installer)
-DEFAULT live
+SAY Wait for installer to start or press <TAB> for more options (live, run)
+DEFAULT installer
 TIMEOUT 50
 PROMPT 1
 
 LABEL installer
   KERNEL /$KERNEL_NAME
-  APPEND boot=UUID=$UUID_SYSTEM installer quiet tty vga=current vt.global_cursor_default=0 loglevel=2
+  APPEND boot=UUID=$UUID_SYSTEM installer quiet tty vga=current
 
 LABEL live
   KERNEL /$KERNEL_NAME
-  APPEND boot=UUID=$UUID_SYSTEM disk=UUID=$UUID_STORAGE portable quiet vt.global_cursor_default=0 loglevel=2
-EOF
+  APPEND boot=UUID=$UUID_SYSTEM live quiet tty vga=current
 
-  if [ "$PROJECT" = Virtual ]; then
-    cat << EOF > "$LE_TMP"/syslinux.cfg
-DEFAULT virtual
-TIMEOUT 50
-PROMPT 0
-
-LABEL virtual
+LABEL run
   KERNEL /$KERNEL_NAME
-  APPEND boot=UUID=$UUID_SYSTEM disk=UUID=$UUID_STORAGE quiet tty vga=current vt.global_cursor_default=0 loglevel=2
+  APPEND boot=UUID=$UUID_SYSTEM disk=UUID=$UUID_STORAGE portable quiet
 EOF
-  fi
 
     mcopy "$LE_TMP/syslinux.cfg" ::
 
@@ -167,16 +165,14 @@ EOF
     mcopy $RELEASE_DIR/target/SYSTEM.md5 ::/SYSTEM.md5
 
     mmd EFI EFI/BOOT
-    mcopy $ROOT/$TOOLCHAIN/share/syslinux/bootx64.efi ::/EFI/BOOT
-    mcopy $ROOT/$TOOLCHAIN/share/syslinux/ldlinux.e64 ::/EFI/BOOT
-    mcopy $ROOT/$TOOLCHAIN/share/syslinux/bootia32.efi ::/EFI/BOOT 
-    mcopy $ROOT/$TOOLCHAIN/share/syslinux/ldlinux.e32 ::/EFI/BOOT
+    mcopy $TOOLCHAIN/share/syslinux/bootx64.efi ::/EFI/BOOT
+    mcopy $TOOLCHAIN/share/syslinux/ldlinux.e64 ::/EFI/BOOT
     mcopy "$LE_TMP"/syslinux.cfg ::/EFI/BOOT
 elif [ "$BOOTLOADER" = "bcm2835-bootloader" ]; then
   # create bootloader configuration
     echo "image: creating bootloader configuration..."
     cat << EOF > "$LE_TMP"/cmdline.txt
-boot=/dev/mmcblk0p1 disk=/dev/mmcblk0p2 quiet $EXTRA_CMDLINE vt.global_cursor_default=0 loglevel=2
+boot=/dev/mmcblk0p1 disk=/dev/mmcblk0p2 quiet $EXTRA_CMDLINE
 EOF
 
     mcopy "$LE_TMP/cmdline.txt" ::
@@ -230,24 +226,9 @@ elif [ "$BOOTLOADER" = "u-boot" ]; then
       dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot-$UBOOT_SYSTEM.imx" of="$DISK" bs=512 seek=2 conv=fsync,notrunc >"$SAVE_ERROR" 2>&1 || show_error
     elif [ -f "$RELEASE_DIR/3rdparty/bootloader/u-boot.imx" ]; then
       dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot.imx" of="$DISK" bs=512 seek=2 conv=fsync,notrunc >"$SAVE_ERROR" 2>&1 || show_error
-    elif [ -n "$UBOOT_SYSTEM" -a -f "$RELEASE_DIR/3rdparty/bootloader/uboot-sunxi-$UBOOT_SYSTEM.bin" ]; then
-      dd if="$RELEASE_DIR/3rdparty/bootloader/uboot-sunxi-$UBOOT_SYSTEM.bin" of="$DISK" bs=1k seek=8 conv=fsync,notrunc
     elif [ -f "$RELEASE_DIR/3rdparty/bootloader/u-boot-fuse" ]; then
      # allow custom dd script for vendor specific fusing
       . $RELEASE_DIR/3rdparty/bootloader/u-boot-fuse
-    elif [ -n "$UBOOT_SYSTEM" -a -f "$RELEASE_DIR/3rdparty/bootloader/uboot-sunxi-$UBOOT_SYSTEM.bin" ]; then
-      dd if="$RELEASE_DIR/3rdparty/bootloader/uboot-sunxi-$UBOOT_SYSTEM.bin" of="$DISK" bs=1k seek=8 conv=fsync,notrunc
-    elif [ -e "$RELEASE_DIR/3rdparty/bootloader/u-boot-sunxi-with-spl.bin" ]; then
-      dd if=$RELEASE_DIR/3rdparty/bootloader/u-boot-sunxi-with-spl.bin of="$DISK" bs=1024 seek=8 conv=fsync,notrunc
-    elif [ -e "$RELEASE_DIR/3rdparty/bootloader/tzsw" ]; then
-      dd if="$RELEASE_DIR/3rdparty/bootloader/bl1" of="$DISK" bs=512 seek=1 conv=notrunc
-      dd if="$RELEASE_DIR/3rdparty/bootloader/bl2" of="$DISK" bs=512 seek=31 conv=notrunc
-      dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot" of="$DISK" bs=512 seek=63 conv=notrunc
-      dd if="$RELEASE_DIR/3rdparty/bootloader/tzsw" of="$DISK" bs=512 seek=2111 conv=notrunc
-    elif [ -e "$RELEASE_DIR/3rdparty/bootloader/bl1.bin.hardkernel" ]; then
-      dd if="$RELEASE_DIR/3rdparty/bootloader/bl1.bin.hardkernel" of="$DISK" bs=1 count=442 conv=notrunc
-      dd if="$RELEASE_DIR/3rdparty/bootloader/bl1.bin.hardkernel" of="$DISK" bs=512 skip=1 seek=1 conv=notrunc
-      dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot.bin" of=$DISK bs=512 seek=64 conv=notrunc
     elif [ -f "$RELEASE_DIR/3rdparty/bootloader/u-boot" ]; then
       dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot" of="$DISK" conv=fsync,notrunc bs=1 count=112 >"$SAVE_ERROR" 2>&1 || show_error
       dd if="$RELEASE_DIR/3rdparty/bootloader/u-boot" of="$DISK" conv=fsync,notrunc bs=512 skip=1 seek=1 >"$SAVE_ERROR" 2>&1 || show_error
@@ -259,23 +240,10 @@ elif [ "$BOOTLOADER" = "u-boot" ]; then
     mcopy $RELEASE_DIR/target/KERNEL.md5 "::/$KERNEL_NAME.md5"
     mcopy $RELEASE_DIR/target/SYSTEM.md5 ::/SYSTEM.md5
 
-    if [ -f $TARGET_IMG/$IMAGE_NAME.dtb ]; then
-      echo "image: copying dtb to part1..."
-      mcopy $TARGET_IMG/$IMAGE_NAME.dtb ::/dtb.img
-    fi
-
     if [ -n "$UBOOT_SYSTEM" -a -f "$RELEASE_DIR/3rdparty/bootloader/u-boot-$UBOOT_SYSTEM.img" ]; then
       mcopy "$RELEASE_DIR/3rdparty/bootloader/u-boot-$UBOOT_SYSTEM.img" ::/u-boot.img
     elif [ -f $RELEASE_DIR/3rdparty/bootloader/u-boot.img ]; then
       mcopy $RELEASE_DIR/3rdparty/bootloader/u-boot.img ::
-    fi
-
-    if [ -f "$RELEASE_DIR/3rdparty/bootloader/$UBOOT_SYSTEM.fex" ]; then
-      mcopy $RELEASE_DIR/3rdparty/bootloader/$UBOOT_SYSTEM.fex ::/script.bin
-    fi
-
-    if [ -f "$RELEASE_DIR/3rdparty/bootloader/script.bin" ]; then
-      mcopy $RELEASE_DIR/3rdparty/bootloader/script.bin ::
     fi
 
     if [ -f $RELEASE_DIR/3rdparty/bootloader/boot-logo.bmp.gz ]; then
@@ -292,18 +260,16 @@ elif [ "$BOOTLOADER" = "u-boot" ]; then
     if [ -f "$RELEASE_DIR/3rdparty/bootloader/dtb.img" ]; then
       mcopy $RELEASE_DIR/3rdparty/bootloader/dtb.img ::
     fi
-
-    if [ -f "$RELEASE_DIR/3rdparty/bootloader/cubieboard2.bin" ]; then
-      mcopy -o $RELEASE_DIR/3rdparty/bootloader/* ::
-    fi
 fi # bootloader
 
-for src in $INSTALL_SRC_DIR/*autoscript.src ; do
-  if [ -e "$src" ] ; then
-    $MKIMAGE_TOOL_CMD "$src" "$LE_TMP/$(basename $src .src)" > /dev/null
-    mcopy "$LE_TMP/$(basename $src .src)" ::
+# run device or project specific mkimage
+  if [ -n "$DEVICE" -a -f $PROJECT_DIR/$PROJECT/devices/$DEVICE/scripts/mkimage ]; then
+    echo "image: running device mkimage..."
+    . $PROJECT_DIR/$PROJECT/devices/$DEVICE/scripts/mkimage
+  elif [ -f $PROJECT_DIR/$PROJECT/scripts/mkimage ]; then
+    echo "image: running project mkimage..."
+    . $PROJECT_DIR/$PROJECT/scripts/mkimage
   fi
-done
 
 # extract part2 from image to format and copy files
   echo "image: extracting part2 from image..."
@@ -314,7 +280,7 @@ done
 # create filesystem on part2
   echo "image: creating filesystem on part2..."
   mke2fs -F -q -t ext4 -m 0 "$LE_TMP/part2.ext4"
-  tune2fs -L "$EXT_VOLUME_LABEL" -U $UUID_STORAGE "$LE_TMP/part2.ext4" >"$SAVE_ERROR" 2>&1 || show_error
+  tune2fs -U $UUID_STORAGE "$LE_TMP/part2.ext4" >"$SAVE_ERROR" 2>&1 || show_error
   e2fsck -n "$LE_TMP/part2.ext4" >"$SAVE_ERROR" 2>&1 || show_error
   sync
 
@@ -340,10 +306,10 @@ done
   fsck -n $LE_TMP/part1.fat >"$SAVE_ERROR" 2>&1 || show_error
 
 # create virtual images
-  if [ "$PROJECT" = Virtual ]; then
+  if [ "$PROJECT" = "Generic" ]; then
     echo "image: creating open virtual appliance..."
     qemu-img convert -O vmdk -o subformat=streamOptimized "$DISK" "$DISK.vmdk"
-    sed -e "s,@DISTRO@,$DISTRO,g" -e "s,@DISK@,$(basename $DISK),g" -e "s,@DISK_SIZE@,$(ls -l $DISK.vmdk | awk '{print $5}'),g" $PROJECT_DIR/$PROJECT/config/ovf.template > $DISK.ovf
+    sed -e "s,@DISTRO@,$DISTRO,g" -e "s,@DISK@,$(basename $DISK),g" -e "s,@DISK_SIZE@,$(($DISK_SIZE*1024*1024)),g" $PROJECT_DIR/$PROJECT/config/ovf.template > $DISK.ovf
     tar -C $TARGET_IMG -cf $DISK.ova $(basename $DISK).ovf $(basename $DISK).vmdk
     echo "image: cleaning up..."
     rm $DISK.vmdk $DISK.ovf
