@@ -19,12 +19,12 @@
 ################################################################################
 
 PKG_NAME="vice"
-PKG_VERSION="3ef72ef"
+PKG_VERSION="d53c427"
 PKG_REV="1"
 PKG_ARCH="any"
 PKG_LICENSE="GPLv2"
-PKG_SITE="https://github.com/libretro/vice-libretro"
-PKG_URL="https://github.com/libretro/vice-libretro/archive/$PKG_VERSION.tar.gz"
+PKG_SITE="https://github.com/tschak909/vice-libretro"
+PKG_URL="https://github.com/tschak909/vice-libretro/archive/$PKG_VERSION.tar.gz"
 PKG_DEPENDS_TARGET="toolchain"
 PKG_PRIORITY="optional"
 PKG_SECTION="libretro"
@@ -43,7 +43,8 @@ make_target() {
   if [ "$ARCH" == "arm" ]; then
     CFLAGS="$CFLAGS -DARM -DALIGN_DWORD -mstructure-size-boundary=32 -mthumb-interwork -falign-functions=16 -marm"
   fi
-  make -f Makefile.libretro EMUTYPE=x64
+  #make -f Makefile.libretro clean ; make -f Makefile.libretro EMUTYPE=x64
+  make -f Makefile.libretro clean ; make -f Makefile.libretro EMUTYPE=xvic 
   #make -f Makefile.libretro EMUTYPE=x128
 }
 
